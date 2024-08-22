@@ -12,9 +12,13 @@ namespace UdonSharpInline {
 
         private List<MethodDeclarationSyntax> _inlineAbleMethods;
 
-        public MethodDeclarationSyntax InlineMethodCalls(MethodDeclarationSyntax method) {
+        private StatementSyntax CreateVariable(string identifier, string originalIdentifier) {
+            return SyntaxFactory.ParseStatement($"var {identifier} = {originalIdentifier};");
+        }
+
+        public (MethodDeclarationSyntax, bool) InlineMethodCalls(MethodDeclarationSyntax method) {
             if (method.Body == null)
-                return method;
+                return (method, false);
 
             var invocations = method.Body.DescendantNodes().OfType<InvocationExpressionSyntax>()
                 .Where(inv =>
@@ -31,37 +35,104 @@ namespace UdonSharpInline {
                 if (methodDeclaration == null)
                     continue; // skip if it doesn't exist in our inline list
 
+                if (methodDeclaration.Identifier.IsEquivalentTo(method.Identifier))
+                    continue;
+
                 invocationMethodPairs.TryAdd(invocation, methodDeclaration);
             }
 
-            var tempBody = method.Body;
+            var tempBody = method.Body.Statements;
+
+            var inlineCount = 0;
 
             foreach (var (invocation, targetMethod) in invocationMethodPairs) {
                 var targetMethodBody = targetMethod.Body;
                 if (targetMethodBody == null)
                     continue;
 
-                Debug.Log($"inv: {invocation.ToString()}, body: {targetMethodBody.ToString()}");
+                var returnType = targetMethod.ReturnType;
+                var hasReturnType = returnType.IsKind(SyntaxKind.PredefinedType) &&
+                                    !((PredefinedTypeSyntax)returnType).Keyword.IsKind(SyntaxKind.VoidKeyword);
+                
+                while (tempBody.IndexOf(s => s.DescendantNodes().Contains(invocation)) != -1) {
+                    targetMethodBody = targetMethod.Body;
+                    var targetMethodStatements = targetMethodBody.Statements;
+                    
+                    // Create local declerations for function
+                    var functionParams = targetMethod.ParameterList.Parameters.Select((t, i) =>
+                            CreateVariable(t.Identifier.ToString(), invocation.ArgumentList.Arguments[i].ToString()))
+                        .ToList();
 
-                var newStatements = targetMethodBody.Statements;
+                    targetMethodStatements = targetMethodStatements.InsertRange(0, functionParams);
+                    //targetMethodStatements = targetMethodStatements.Add(endLabel);
+                    targetMethodBody = targetMethodBody.WithStatements(targetMethodStatements);
 
-                tempBody = SyntaxFactory.Block(
-                    tempBody.Statements.SelectMany<StatementSyntax, StatementSyntax>(stmt => {
-                        if (stmt.Contains(invocation))
-                            return newStatements;
+                    var insertPlacement = tempBody.IndexOf(s => s.DescendantNodes().Contains(invocation));
 
-                        return new[] { stmt };
-                    })
-                );
+                    if (hasReturnType) {
+                        var returnSyntax =
+                            targetMethodStatements.First(s => s is ReturnStatementSyntax) as ReturnStatementSyntax;
+                        var returnNodes = returnSyntax.DescendantNodes();
 
-                tempBody = tempBody.ReplaceNode(invocation, newStatements);
+                        var callStatement =
+                            tempBody.First(s => s.DescendantNodes().Any(d => d.IsEquivalentTo(invocation)));
+                        var callStatementNodes = callStatement.DescendantNodes().ToList();
+                        var callStatementInv = callStatementNodes.First(s => s.IsEquivalentTo(invocation));
+                        
+                        // Get the parent statement of the invocation (usually an ExpressionStatementSyntax)
+                        var parentStatement = callStatement.Ancestors().OfType<StatementSyntax>().First();
 
-                Debug.Log(tempBody.ToFullString());
+                        /*targetMethodBody.Statements.Where(node => !node.IsKind(SyntaxKind.ReturnKeyword));
+
+                        // Get the parent block that contains the statement
+                        
+                        // Insert the new statement before the parent statement
+                        switch (parentStatement) {
+                            case BlockSyntax block:
+                                var newBlock = block.WithStatements(
+                                    block.Statements.Insert(block.Statements.IndexOf(s => s.IsEquivalentTo(callStatement)), targetMethodBody)
+                                );
+                                tempBody = method.Body.WithStatements(tempBody).ReplaceNode(parentStatement, newBlock).Statements;
+                                break;
+                            default:
+                                Debug.LogError(parentStatement.Kind());
+                                break;
+                        }
+                        
+                        callStatement =
+                            tempBody.First(s => s.DescendantNodes().Any(d => d.IsEquivalentTo(invocation)));
+                        callStatementNodes = callStatement.DescendantNodes().ToList();
+                        callStatementInv = callStatementNodes.First(s => s.IsEquivalentTo(invocation));
+                        */
+
+                        // Replace the old block with the new block in the root
+                        
+                        
+                        //SyntaxFactory.Block(SyntaxFactory.EmptyStatement(), callStatement.ReplaceNode(callStatementInv, returnNodes.First()), )
+                        
+                        var newCallStatement = callStatement.ReplaceNode(callStatementInv, returnNodes.First());
+
+                        insertPlacement = tempBody.IndexOf(callStatement);
+                        tempBody = tempBody.Replace(callStatement, newCallStatement);
+                        
+                        var rewriter = new FunctionInserterRewriter(invocation, targetMethodBody);
+                        tempBody = method.WithBody((BlockSyntax)rewriter.Visit(method.WithBody(method.Body.WithStatements(tempBody)))).Body.Statements;
+                    }
+                    
+                    //var rewriter = new FunctionInserterRewriter(invocation, method);
+                    /*if (targetMethodStatements.Any(s => s is ReturnStatementSyntax))
+                        targetMethodStatements =
+                            targetMethodStatements.Remove(
+                                targetMethodStatements.First(s => s is ReturnStatementSyntax));
+
+                    tempBody = tempBody.InsertRange(insertPlacement, targetMethodStatements);*/
+
+                    inlineCount++;
+                }
             }
 
-            method.WithBody(tempBody);
-
-            return method;
+            method = method.WithBody(method.Body.WithStatements(tempBody));
+            return (method, inlineCount > 0);
         }
 
         // Probably shouldn't be using a syntax walker for this..
@@ -74,14 +145,10 @@ namespace UdonSharpInline {
                     var classDeclarations = _root.DescendantNodes().OfType<ClassDeclarationSyntax>();
 
                     foreach (var classDeclaration in classDeclarations) {
-                        var inheritsFromBaseClass = classDeclaration.BaseList?.Types
-                            .Any(baseType => baseType.ToString() == "UdonSharpBehaviour") ?? false;
-                        if (!inheritsFromBaseClass) continue; // Skip if it's not a UdonSharpBehaviour
-
                         var inlineWholeClass = classDeclaration.AttributeLists.SelectMany(a => a.Attributes)
                             .Any(attr => attr.Name.ToString() == "Inline");
 
-                        var allMethods = _root
+                        var allMethods = classDeclaration
                             .DescendantNodes()
                             .OfType<MethodDeclarationSyntax>()
                             .ToList();
@@ -96,18 +163,43 @@ namespace UdonSharpInline {
                                     .Any(attr => attr.Name.ToString() == "Inline"))
                                 .ToList();
 
+                        if (inlineWholeClass)
+                            _inlineAbleMethods = _inlineAbleMethods.Where(m =>
+                                m.DescendantNodes().OfType<ReturnStatementSyntax>().Count() < 2).ToList();
+                        else {
+                            var tempCopy = _inlineAbleMethods.ToList();
+                            foreach (var inlineAbleMethod in tempCopy.Where(inlineAbleMethod =>
+                                         inlineAbleMethod.DescendantNodes().OfType<ReturnStatementSyntax>().Count() >
+                                         1)) {
+                                Debug.LogError("Can't inline methods with more than one Return!");
+                                _inlineAbleMethods.Remove(inlineAbleMethod);
+                            }
+                        }
+
                         if (_inlineAbleMethods.Count == 0)
                             continue;
-                        
-                        var newMethods = allMethods.Select(InlineMethodCalls).ToList();
 
                         var newClassDeclaration = classDeclaration;
-                        for (int i = 0; i < newMethods.Count; i++) {
-                            newClassDeclaration.ReplaceNode(allMethods[i], newMethods[i]);
+                        var continueInlining = true;
+                        for (int i = 0; i < 3; i++) {
+                            if (!continueInlining)
+                                break;
+                            continueInlining = false;
+                            for (var index = 0; index < allMethods.Count; index++) {
+                                var method = newClassDeclaration
+                                    .DescendantNodes()
+                                    .OfType<MethodDeclarationSyntax>()
+                                    .ToList()[index];
+
+                                var (inlined, success) = InlineMethodCalls(method);
+                                continueInlining |= success;
+                                if (success)
+                                    newClassDeclaration = newClassDeclaration.ReplaceNode(method, inlined);
+                            }
                         }
-                        
+
                         Debug.Log(newClassDeclaration.ToFullString());
-                        
+
                         node = _root.ReplaceNode(classDeclaration, newClassDeclaration);
                     }
                 }
